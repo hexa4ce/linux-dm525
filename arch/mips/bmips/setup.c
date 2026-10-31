@@ -25,6 +25,7 @@
 #include <asm/mipsregs.h>
 #include <asm/prom.h>
 #include <asm/smp-ops.h>
+#include <asm/setup.h>
 #include <asm/time.h>
 #include <asm/traps.h>
 #include <asm/fw/cfe/cfe_api.h>
@@ -200,6 +201,15 @@ void __init plat_mem_setup(void)
 		cfe_die("no dtb found");
 
 	__dt_setup_arch(dtb);
+
+	/*
+	 * DM525 service UART is a 16550 at 0x10406800, 32-bit stride.
+	 * CFE leaves it at 115200. This writer only polls LSR and writes
+	 * TX, and it gives up instead of spinning, which is what the
+	 * 8250 earlycon did after printing "earlycon:".
+	 */
+	if (of_flat_dt_is_compatible(of_get_flat_dt_root(), "dreambox,dm525"))
+		setup_8250_early_printk_port(CKSEG1ADDR(0x10406800), 2, 50000);
 
 	for (q = bmips_quirk_list; q->quirk_fn; q++) {
 		if (of_flat_dt_is_compatible(of_get_flat_dt_root(),

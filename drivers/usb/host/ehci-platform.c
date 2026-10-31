@@ -77,9 +77,17 @@ static int ehci_platform_reset(struct usb_hcd *hcd)
 	if (pdata->no_io_watchdog)
 		ehci->need_io_watchdog = 0;
 
-	if (of_device_is_compatible(pdev->dev.of_node, "brcm,xgs-iproc-ehci"))
+	if (of_device_is_compatible(pdev->dev.of_node, "brcm,xgs-iproc-ehci") ||
+	    of_device_is_compatible(pdev->dev.of_node, "brcm,bcm73625-ehci"))
 		ehci_writel(ehci, BCM_USB_FIFO_THRESHOLD,
 			    &ehci->regs->brcm_insnreg[1]);
+	/*
+	 * Same register the STB EHCI driver writes. bcm73625 is little-endian,
+	 * so this stays on the generic driver instead of ehci-brcm, which
+	 * forces big-endian MMIO.
+	 */
+	if (of_device_is_compatible(pdev->dev.of_node, "brcm,bcm73625-ehci"))
+		ehci_writel(ehci, 0x00000001, &ehci->regs->brcm_insnreg[3]);
 
 	return 0;
 }
@@ -511,6 +519,7 @@ static const struct of_device_id vt8500_ehci_ids[] = {
 	{ .compatible = "via,vt8500-ehci", },
 	{ .compatible = "wm,prizm-ehci", },
 	{ .compatible = "generic-ehci", },
+	{ .compatible = "brcm,bcm73625-ehci", },
 	{ .compatible = "cavium,octeon-6335-ehci", },
 	{ .compatible = "aspeed,ast2700-ehci",	.data = (void *)1 },
 	{}

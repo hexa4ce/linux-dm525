@@ -403,13 +403,20 @@ int bcmgenet_mii_probe(struct net_device *dev)
 	 * the link operates at 10Mbps, so fallback to polling for
 	 * those versions of GENET.
 	 */
-	if (priv->internal_phy && !GENET_IS_V5(priv))
+	/*
+	 * brcm,eee-broken marks the BCM73625 GENET. Its MAC link IRQ was
+	 * not observed, so poll the PHY. EEE advertisement is skipped
+	 * because the EEE block bus-errors.
+	 */
+	if (priv->internal_phy && !GENET_IS_V5(priv) &&
+	    !of_property_read_bool(dn, "brcm,eee-broken"))
 		dev->phydev->irq = PHY_MAC_INTERRUPT;
 
 	/* Indicate that the MAC is responsible for PHY PM */
 	dev->phydev->mac_managed_pm = true;
 
-	if (!GENET_IS_V1(priv))
+	if (!GENET_IS_V1(priv) &&
+	    !of_property_read_bool(dn, "brcm,eee-broken"))
 		phy_support_eee(dev->phydev);
 
 	return 0;

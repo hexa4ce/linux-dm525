@@ -1,0 +1,197 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Dreambox DM525 (BCM73625A0, BMIPS4380 V6.5, little-endian).
+ *
+ * Not a BCM7362. The RDB window base 0x10000000 is the same translation
+ * that puts this SoC's captured peripherals at the addresses below, but
+ * the memory map is the vendor map for this box and nothing else is
+ * copied from bcm7362.dtsi.
+ *
+ * Usable RAM (first boot, decoder bmem left reserved):
+ *   0x00000000-0x03ffffff  64 MiB
+ *   0x20000000-0x2fffffff  256 MiB
+ * 0x04000000-0x0fffffff is the vendor bmem window and is not registered.
+ *
+ * Captured MMIO, not instantiated here:
+ *   NAND  0x10412800
+ *   SPI   0x10413000
+ *
+ * USB host is instantiated. EHCI 0x10480300 and OHCI 0x10480400 match
+ * /proc/iomem. The vendor Linux IRQ numbers were 66 and 67, one above
+ * the hardware lines (the same +1 offset as the UART at linux IRQ 62
+ * versus hardware line 61). The L1 controller address is the one every
+ * BCM7xxx STB dts in this tree uses for this RDB window; it was not in
+ * /proc/iomem.
+ */
+/dts-v1/;
+
+/ {
+	compatible = "dreambox,dm525", "brcm,bcm73625";
+	model = "Dreambox DM525";
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* BMIPS count register runs at half the 751 MHz CPU clock. */
+		mips-hpt-frequency = <375500000>;
+
+		cpu@0 {
+			compatible = "brcm,bmips4380";
+			device_type = "cpu";
+			reg = <0>;
+		};
+
+		/* Second thread on the one BMIPS4380 core. */
+		cpu@1 {
+			compatible = "brcm,bmips4380";
+			device_type = "cpu";
+			reg = <1>;
+		};
+	};
+
+	cpu_intc: interrupt-controller {
+		compatible = "mti,cpu-interrupt-controller";
+		#address-cells = <0>;
+		interrupt-controller;
+		#interrupt-cells = <1>;
+	};
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		/*
+		 * No earlycon=. The 8250 earlycon on this UART prints a
+		 * few lines and then waits forever for the shift register
+		 * to go empty. Early printk uses the divisor CFE left at
+		 * 115200 until the ttyS0 console takes over.
+		 */
+		bootargs = "console=ttyS0,115200";
+		stdout-path = &uart0;
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x04000000>,
+		      <0x20000000 0x10000000>;
+	};
+
+	rdb {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x10000000 0x01000000>;
+
+		/*
+		 * Same RDB slot as the other BCM7xxx STB chips whose UART
+		 * and USB addresses match this board. The soc-id driver
+		 * does not match a plain syscon, so this is not read
+		 * until reboot.
+		 */
+		sun_top_ctrl: syscon@404000 {
+			compatible = "syscon";
+			reg = <0x404000 0x400>;
+			native-endian;
+		};
+
+		reboot {
+			compatible = "brcm,brcmstb-reboot";
+			syscon = <&sun_top_ctrl 0x304 0x308>;
+		};
+
+		periph_intc: interrupt-controller@411400 {
+			compatible = "brcm,bcm7038-l1-intc";
+			reg = <0x411400 0x30>, <0x411600 0x30>;
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			interrupt-parent = <&cpu_intc>;
+			interrupts = <2>, <3>;
+		};
+
+		/*
+		 * 0x406800 + 0x10000000 = 0x10406800, size 0x20.
+		 * Eight 16550 registers at a 4-byte stride (reg-shift 2).
+		 * CFE left divisor 5 and LCR 8N1, which is 115200 from a
+		 * 9.216 MHz UART clock. clock-frequency makes the 8250
+		 * driver program that same divisor. The UART's own
+		 * interrupt is pending in IIR while L1 line 61 stays
+		 * clear, so the port is polled instead of wired to an IRQ.
+		 */
+		uart0: serial@406800 {
+			compatible = "ns16550a";
+			reg = <0x406800 0x20>;
+			reg-io-width = <4>;
+			reg-shift = <2>;
+			native-endian;
+			clock-frequency = <9216000>;
+			current-speed = <115200>;
+			no-loopback-test;
+		};
+
+		/*
+		 * Onboard internal PHY. Vendor /proc/iomem maps
+		 * 0x10430000-0x10434fff, which is this RDB offset.
+		 * That 20 KiB window matches the GENET v2 register
+		 * layout. CFE reports PHY address 1, internal, 100 Mbit.
+		 * Interrupt lines are the BCM7362 ones; the same numbering
+		 * is what made USB enumerate.
+		 */
+		enet0: ethernet@430000 {
+			compatible = "brcm,genet-v2";
+			reg = <0x430000 0x5000>;
+			interrupts = <24>, <25>;
+			interrupt-parent = <&periph_intc>;
+			phy-mode = "internal";
+			phy-handle = <&phy1>;
+			mac-address = [ 00 09 34 40 16 80 ];
+			/* RBUF_ENERGY_CTRL is not implemented; reading it oopses. */
+			brcm,eee-broken;
+			/*
+			 * 24 is the general line. On this v2 it also carries
+			 * default-queue TX/RX DMA-done. 25 is the per-queue line.
+			 */
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			mdio@e14 {
+				compatible = "brcm,genet-mdio-v2";
+				#address-cells = <1>;
+				#size-cells = <0>;
+				reg = <0xe14 0x8>;
+
+				phy1: ethernet-phy@1 {
+					compatible = "brcm,40nm-ephy",
+						     "ethernet-phy-ieee802.3-c22";
+					reg = <1>;
+					max-speed = <100>;
+				};
+			};
+		};
+
+		ehci0: usb@480300 {
+			compatible = "brcm,bcm73625-ehci", "generic-ehci";
+			reg = <0x480300 0x100>;
+			native-endian;
+			/*
+			 * Port-overcurrent reads as stuck on this SoC. Without
+			 * this the hub powers the ports off and nothing enumerates.
+			 */
+			spurious-oc;
+			interrupt-parent = <&periph_intc>;
+			interrupts = <65>;
+		};
+
+		ohci0: usb@480400 {
+			compatible = "generic-ohci";
+			reg = <0x480400 0x100>;
+			native-endian;
+			no-big-frame-no;
+			interrupt-parent = <&periph_intc>;
+			interrupts = <66>;
+		};
+	};
+};

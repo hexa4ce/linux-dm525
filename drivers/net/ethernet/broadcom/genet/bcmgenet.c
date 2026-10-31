@@ -19,6 +19,7 @@
 #include <linux/init.h>
 #include <linux/errno.h>
 #include <linux/delay.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/dma-mapping.h>
 #include <linux/pm.h>
@@ -1364,6 +1365,13 @@ void bcmgenet_eee_enable_set(struct net_device *dev, bool enable)
 	u32 off = priv->hw_params->tbuf_offset + TBUF_ENERGY_CTRL;
 	u32 reg;
 
+	/*
+	 * BCM73625 GENET 2.0 bus-errors on a read of RBUF_ENERGY_CTRL.
+	 * Link setup calls this on every PHY change, so leave EEE alone.
+	 */
+	if (of_property_read_bool(priv->pdev->dev.of_node, "brcm,eee-broken"))
+		return;
+
 	if (enable && !priv->clk_eee_enabled) {
 		clk_prepare_enable(priv->clk_eee);
 		priv->clk_eee_enabled = true;
@@ -1849,11 +1857,21 @@ static struct enet_cb *bcmgenet_put_txcb(struct bcmgenet_priv *priv,
 	return tx_cb_ptr;
 }
 
+/* v1/v2 report the default queue on INTRL2_0, not on the per-queue block. */
+static bool bcmgenet_legacy_dma_irq(struct bcmgenet_priv *priv,
+				    unsigned int index)
+{
+	return !index && (GENET_IS_V1(priv) || GENET_IS_V2(priv));
+}
+
 static inline void bcmgenet_rx_ring_int_disable(struct bcmgenet_rx_ring *ring)
 {
 	bcmgenet_intrl2_1_writel(ring->priv,
 				 1 << (UMAC_IRQ1_RX_INTR_SHIFT + ring->index),
 				 INTRL2_CPU_MASK_SET);
+	if (bcmgenet_legacy_dma_irq(ring->priv, ring->index))
+		bcmgenet_intrl2_0_writel(ring->priv, UMAC_IRQ_RXDMA_DONE,
+					 INTRL2_CPU_MASK_SET);
 }
 
 static inline void bcmgenet_rx_ring_int_enable(struct bcmgenet_rx_ring *ring)
@@ -1861,18 +1879,27 @@ static inline void bcmgenet_rx_ring_int_enable(struct bcmgenet_rx_ring *ring)
 	bcmgenet_intrl2_1_writel(ring->priv,
 				 1 << (UMAC_IRQ1_RX_INTR_SHIFT + ring->index),
 				 INTRL2_CPU_MASK_CLEAR);
+	if (bcmgenet_legacy_dma_irq(ring->priv, ring->index))
+		bcmgenet_intrl2_0_writel(ring->priv, UMAC_IRQ_RXDMA_DONE,
+					 INTRL2_CPU_MASK_CLEAR);
 }
 
 static inline void bcmgenet_tx_ring_int_enable(struct bcmgenet_tx_ring *ring)
 {
 	bcmgenet_intrl2_1_writel(ring->priv, 1 << ring->index,
 				 INTRL2_CPU_MASK_CLEAR);
+	if (bcmgenet_legacy_dma_irq(ring->priv, ring->index))
+		bcmgenet_intrl2_0_writel(ring->priv, UMAC_IRQ_TXDMA_DONE,
+					 INTRL2_CPU_MASK_CLEAR);
 }
 
 static inline void bcmgenet_tx_ring_int_disable(struct bcmgenet_tx_ring *ring)
 {
 	bcmgenet_intrl2_1_writel(ring->priv, 1 << ring->index,
 				 INTRL2_CPU_MASK_SET);
+	if (bcmgenet_legacy_dma_irq(ring->priv, ring->index))
+		bcmgenet_intrl2_0_writel(ring->priv, UMAC_IRQ_TXDMA_DONE,
+					 INTRL2_CPU_MASK_SET);
 }
 
 /* Simple helper to free a transmit control block's resources
@@ -1937,6 +1964,9 @@ static unsigned int __bcmgenet_tx_reclaim(struct net_device *dev,
 
 	/* Clear status before servicing to reduce spurious interrupts */
 	bcmgenet_intrl2_1_writel(priv, (1 << ring->index), INTRL2_CPU_CLEAR);
+	if (bcmgenet_legacy_dma_irq(priv, ring->index))
+		bcmgenet_intrl2_0_writel(priv, UMAC_IRQ_TXDMA_DONE,
+					 INTRL2_CPU_CLEAR);
 
 	/* Compute how many buffers are transmitted since last xmit call */
 	c_index = bcmgenet_tdma_ring_readl(priv, ring->index, TDMA_CONS_INDEX)
@@ -2315,6 +2345,9 @@ static unsigned int bcmgenet_desc_rx(struct bcmgenet_rx_ring *ring,
 	/* Clear status before servicing to reduce spurious interrupts */
 	mask = 1 << (UMAC_IRQ1_RX_INTR_SHIFT + ring->index);
 	bcmgenet_intrl2_1_writel(priv, mask, INTRL2_CPU_CLEAR);
+	if (bcmgenet_legacy_dma_irq(priv, ring->index))
+		bcmgenet_intrl2_0_writel(priv, UMAC_IRQ_RXDMA_DONE,
+					 INTRL2_CPU_CLEAR);
 
 	p_index = bcmgenet_rdma_ring_readl(priv, ring->index, RDMA_PROD_INDEX);
 
@@ -3311,6 +3344,31 @@ static irqreturn_t bcmgenet_isr0(int irq, void *dev_id)
 	if (bcmgenet_has_mdio_intr(priv) && status & UMAC_IRQ_MDIO_EVENT)
 		wake_up(&priv->wq);
 
+	/*
+	 * v1/v2 default queue: TX/RX DMA-done are in this block and raise
+	 * the first L1 line. Later GENET reports those on INTRL2_1.
+	 */
+	if ((GENET_IS_V1(priv) || GENET_IS_V2(priv)) &&
+	    (status & (UMAC_IRQ_RXDMA_DONE | UMAC_IRQ_TXDMA_DONE))) {
+		struct bcmgenet_rx_ring *rx_ring;
+		struct bcmgenet_tx_ring *tx_ring;
+
+		if (status & UMAC_IRQ_RXDMA_DONE) {
+			rx_ring = &priv->rx_rings[0];
+			if (likely(napi_schedule_prep(&rx_ring->napi))) {
+				bcmgenet_rx_ring_int_disable(rx_ring);
+				__napi_schedule_irqoff(&rx_ring->napi);
+			}
+		}
+		if (status & UMAC_IRQ_TXDMA_DONE) {
+			tx_ring = &priv->tx_rings[0];
+			if (likely(napi_schedule_prep(&tx_ring->napi))) {
+				bcmgenet_tx_ring_int_disable(tx_ring);
+				__napi_schedule_irqoff(&tx_ring->napi);
+			}
+		}
+	}
+
 	/* all other interested interrupts handled in bottom half */
 	status &= (UMAC_IRQ_LINK_EVENT | UMAC_IRQ_PHY_DET_R);
 	if (status) {
@@ -3564,14 +3622,22 @@ static void bcmgenet_timeout(struct net_device *dev, unsigned int txqueue)
 	struct bcmgenet_tx_ring *ring = &priv->tx_rings[txqueue];
 	struct netdev_queue *txq = netdev_get_tx_queue(dev, txqueue);
 
-	netif_dbg(priv, tx_err, dev, "bcmgenet_timeout\n");
+	netdev_err(dev,
+		   "tx queue %u timeout hw prod %u cons %u intr0 %#x intr1 %#x\n",
+		   txqueue,
+		   bcmgenet_tdma_ring_readl(priv, txqueue, TDMA_PROD_INDEX) &
+		   DMA_P_INDEX_MASK,
+		   bcmgenet_tdma_ring_readl(priv, txqueue, TDMA_CONS_INDEX) &
+		   DMA_C_INDEX_MASK,
+		   bcmgenet_intrl2_0_readl(priv, INTRL2_CPU_STAT),
+		   bcmgenet_intrl2_1_readl(priv, INTRL2_CPU_STAT));
 
 	bcmgenet_dump_tx_queue(ring);
 
 	bcmgenet_tx_reclaim(dev, ring, true);
 
 	/* Re-enable the TX interrupt for this ring */
-	bcmgenet_intrl2_1_writel(priv, 1 << txqueue, INTRL2_CPU_MASK_CLEAR);
+	bcmgenet_tx_ring_int_enable(ring);
 
 	txq_trans_cond_update(txq);
 
@@ -4157,7 +4223,14 @@ static int bcmgenet_probe(struct platform_device *pdev)
 		goto err_clk_disable;
 
 	/* setup number of real queues + 1 */
-	netif_set_real_num_tx_queues(priv->dev, priv->hw_params->tx_queues + 1);
+	/*
+	 * v1/v2 complete the default queue through INTRL2_0. The extra
+	 * rings are priority queues on the second line; leave them unused
+	 * so every packet is the one that interrupt covers.
+	 */
+	netif_set_real_num_tx_queues(priv->dev,
+		(GENET_IS_V1(priv) || GENET_IS_V2(priv)) ? 1 :
+		priv->hw_params->tx_queues + 1);
 	netif_set_real_num_rx_queues(priv->dev, priv->hw_params->rx_queues + 1);
 
 	/* Set default coalescing parameters */

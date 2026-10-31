@@ -115,28 +115,38 @@ static void bcm7038_l1_irq_handle(struct irq_desc *desc)
 	struct bcm7038_l1_chip *intc = irq_desc_get_handler_data(desc);
 	struct bcm7038_l1_cpu *cpu;
 	struct irq_chip *chip = irq_desc_get_chip(desc);
-	unsigned int idx;
-
-#if defined(CONFIG_SMP) && defined(CONFIG_MIPS)
-	cpu = intc->cpus[cpu_logical_map(smp_processor_id())];
-#else
-	cpu = intc->cpus[0];
-#endif
+	unsigned int idx, cpu_i;
 
 	chained_irq_enter(chip, desc);
 
-	for (idx = 0; idx < intc->n_words; idx++) {
-		int base = idx * IRQS_PER_WORD;
-		unsigned long pending, flags;
-		int hwirq;
+	/*
+	 * On BMIPS the L1 output can show up in either thread's status
+	 * block. Scan every block that was mapped, not only this CPU's.
+	 */
+#if defined(CONFIG_SMP) && defined(CONFIG_MIPS)
+	for (cpu_i = 0; cpu_i < NR_CPUS; cpu_i++) {
+		cpu = intc->cpus[cpu_i];
+		if (!cpu)
+			continue;
+#else
+	cpu = intc->cpus[0];
+	if (cpu) {
+		unsigned int cpu_i = 0;
+		(void)cpu_i;
+#endif
+		for (idx = 0; idx < intc->n_words; idx++) {
+			int base = idx * IRQS_PER_WORD;
+			unsigned long pending, flags;
+			int hwirq;
 
-		raw_spin_lock_irqsave(&intc->lock, flags);
-		pending = l1_readl(cpu->map_base + reg_status(intc, idx)) &
-			  ~cpu->mask_cache[idx];
-		raw_spin_unlock_irqrestore(&intc->lock, flags);
+			raw_spin_lock_irqsave(&intc->lock, flags);
+			pending = l1_readl(cpu->map_base + reg_status(intc, idx)) &
+				  ~cpu->mask_cache[idx];
+			raw_spin_unlock_irqrestore(&intc->lock, flags);
 
-		for_each_set_bit(hwirq, &pending, IRQS_PER_WORD)
-			generic_handle_domain_irq(intc->domain, base + hwirq);
+			for_each_set_bit(hwirq, &pending, IRQS_PER_WORD)
+				generic_handle_domain_irq(intc->domain, base + hwirq);
+		}
 	}
 
 	chained_irq_exit(chip, desc);
@@ -168,9 +178,16 @@ static void bcm7038_l1_unmask(struct irq_data *d)
 {
 	struct bcm7038_l1_chip *intc = irq_data_get_irq_chip_data(d);
 	unsigned long flags;
+	unsigned int cpu;
 
 	raw_spin_lock_irqsave(&intc->lock, flags);
+#if defined(CONFIG_SMP) && defined(CONFIG_MIPS)
+	for_each_possible_cpu(cpu)
+		if (intc->cpus[cpu])
+			__bcm7038_l1_unmask(d, cpu);
+#else
 	__bcm7038_l1_unmask(d, intc->affinity[d->hwirq]);
+#endif
 	raw_spin_unlock_irqrestore(&intc->lock, flags);
 }
 
@@ -178,9 +195,16 @@ static void bcm7038_l1_mask(struct irq_data *d)
 {
 	struct bcm7038_l1_chip *intc = irq_data_get_irq_chip_data(d);
 	unsigned long flags;
+	unsigned int cpu;
 
 	raw_spin_lock_irqsave(&intc->lock, flags);
+#if defined(CONFIG_SMP) && defined(CONFIG_MIPS)
+	for_each_possible_cpu(cpu)
+		if (intc->cpus[cpu])
+			__bcm7038_l1_mask(d, cpu);
+#else
 	__bcm7038_l1_mask(d, intc->affinity[d->hwirq]);
+#endif
 	raw_spin_unlock_irqrestore(&intc->lock, flags);
 }
 
@@ -213,8 +237,8 @@ static int bcm7038_l1_set_affinity(struct irq_data *d,
 }
 #endif
 
-static int bcm7038_l1_init_one(struct device_node *dn, unsigned int idx,
-			       struct bcm7038_l1_chip *intc)
+static int bcm7038_l1_init_one(struct device_node *dn, unsigned int cpu_idx,
+			       unsigned int res_idx, struct bcm7038_l1_chip *intc)
 {
 	struct resource res;
 	resource_size_t sz;
@@ -222,7 +246,7 @@ static int bcm7038_l1_init_one(struct device_node *dn, unsigned int idx,
 	unsigned int i, n_words, parent_irq;
 	int ret;
 
-	if (of_address_to_resource(dn, idx, &res))
+	if (of_address_to_resource(dn, res_idx, &res))
 		return -EINVAL;
 	sz = resource_size(&res);
 	n_words = sz / REG_BYTES_PER_IRQ_WORD;
@@ -242,7 +266,7 @@ static int bcm7038_l1_init_one(struct device_node *dn, unsigned int idx,
 		return -EINVAL;
 	}
 
-	cpu = intc->cpus[idx] = kzalloc_flex(*cpu, mask_cache, n_words);
+	cpu = intc->cpus[cpu_idx] = kzalloc_flex(*cpu, mask_cache, n_words);
 	if (!cpu)
 		return -ENOMEM;
 
@@ -258,7 +282,7 @@ static int bcm7038_l1_init_one(struct device_node *dn, unsigned int idx,
 		cpu->mask_cache[i] = ~intc->irq_fwd_mask[i];
 	}
 
-	parent_irq = irq_of_parse_and_map(dn, idx);
+	parent_irq = irq_of_parse_and_map(dn, res_idx);
 	if (!parent_irq) {
 		pr_err("failed to map parent interrupt %d\n", parent_irq);
 		return -EINVAL;
@@ -290,12 +314,8 @@ static int bcm7038_l1_suspend(void *data)
 	int boot_cpu, word;
 	u32 val;
 
-	/* Wakeup interrupt should only come from the boot cpu */
-#if defined(CONFIG_SMP) && defined(CONFIG_MIPS)
-	boot_cpu = cpu_logical_map(0);
-#else
+	/* cpus[] is indexed by logical id. The boot CPU is logical 0. */
 	boot_cpu = 0;
-#endif
 
 	list_for_each_entry(intc, &bcm7038_l1_intcs_list, list) {
 		for (word = 0; word < intc->n_words; word++) {
@@ -315,11 +335,7 @@ static void bcm7038_l1_resume(void *data)
 	struct bcm7038_l1_chip *intc;
 	int boot_cpu, word;
 
-#if defined(CONFIG_SMP) && defined(CONFIG_MIPS)
-	boot_cpu = cpu_logical_map(0);
-#else
 	boot_cpu = 0;
-#endif
 
 	list_for_each_entry(intc, &bcm7038_l1_intcs_list, list) {
 		for (word = 0; word < intc->n_words; word++) {
@@ -403,13 +419,24 @@ static int bcm7038_l1_probe(struct platform_device *pdev, struct device_node *pa
 
 	raw_spin_lock_init(&intc->lock);
 	for_each_possible_cpu(idx) {
-		ret = bcm7038_l1_init_one(dn, idx, intc);
+		/*
+		 * The reg tuples are one per physical thread, in thread
+		 * order. Logical CPU 0 is whichever thread booted.
+		 */
+		unsigned int hwcpu = idx;
+
+#if defined(CONFIG_SMP) && defined(CONFIG_MIPS)
+		hwcpu = cpu_logical_map(idx);
+#endif
+
+		ret = bcm7038_l1_init_one(dn, idx, hwcpu, intc);
 		if (ret < 0) {
 			if (idx)
 				break;
 			pr_err("failed to remap intc L1 registers\n");
 			goto out_free;
 		}
+		pr_info("L1 logical CPU %u -> register block %u\n", idx, hwcpu);
 	}
 
 	intc->domain = irq_domain_create_linear(of_fwnode_handle(dn), IRQS_PER_WORD * intc->n_words,
