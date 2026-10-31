@@ -7,10 +7,12 @@
  * the memory map is the vendor map for this box and nothing else is
  * copied from bcm7362.dtsi.
  *
- * Usable RAM (first boot, decoder bmem left reserved):
- *   0x00000000-0x03ffffff  64 MiB
- *   0x20000000-0x2fffffff  256 MiB
- * 0x04000000-0x0fffffff is the vendor bmem window and is not registered.
+ * RAM is 512 MiB in two banks. The vendor kernel reserved
+ * 0x04000000-0x0fffffff as decoder bmem. This kernel has no decoder
+ * driver and no video output, so that window is normal memory.
+ * The bank at 0x20000000 is above the 512 MiB direct map, so it is
+ * highmem. 16 KiB pages remove the dcache alias that made Linux
+ * drop highmem on this CPU.
  *
  * Captured MMIO, not instantiated here:
  *   NAND  0x10412800
@@ -76,7 +78,7 @@
 
 	memory@0 {
 		device_type = "memory";
-		reg = <0x00000000 0x04000000>,
+		reg = <0x00000000 0x10000000>,
 		      <0x20000000 0x10000000>;
 	};
 
